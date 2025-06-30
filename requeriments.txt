@@ -1,0 +1,34 @@
+opencv-python
+numpy
+mediapipe
+insightface
+torch
+ultralytics
+scikit-learn
+tensorflow
+keras
+pillow
+matplotlib
+
+
+opencv-python → Manipulação de imagens e vídeos.
+
+numpy → Manipulação eficiente de arrays numéricos.
+
+mediapipe → Detecção facial otimizada.
+
+insightface → Embeddings faciais com ArcFace.
+
+torch → Necessário para algumas operações do InsightFace.
+
+ultralytics → Biblioteca para rodar YOLOv8.
+
+scikit-learn → Processamento de dados e encoding de labels.
+
+tensorflow → Redes neurais e deep learning.
+
+keras → Construção e treinamento de modelos.
+
+pillow → Manipulação de imagens.
+
+matplotlib → Visualização de gráficos.
