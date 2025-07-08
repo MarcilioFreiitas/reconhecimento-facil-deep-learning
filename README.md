@@ -1,7 +1,4 @@
-Excelente README! Vou **adaptar o texto para o seu novo código** e sugerir melhorias para que o README fique fiel ao seu pipeline atual (YOLOv8 + DeepSORT + InsightFace, com prints de GPU, etc).
-Vou focar na clareza, realismo e orientar sobre dependências para CPU/GPU, incluindo dicas práticas de instalação.
 
----
 
 # Reconhecimento Fácil Deep Learning 🎥🤖
 
