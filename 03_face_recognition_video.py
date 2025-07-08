@@ -1,77 +1,107 @@
 import os
+import time
 from collections import deque
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import cv2
-import pickle
 import numpy as np
-import insightface
-from numpy.linalg import norm
+import pickle
 from ultralytics import YOLO
-import concurrent.futures
-import time
+from deep_sort_realtime.deepsort_tracker import DeepSort
+import insightface
+
+# Checagem do dispositivo do PyTorch/YOLO
+try:
+    import torch
+    torch_available = True
+    yolo_uses_gpu = torch.cuda.is_available()
+    if yolo_uses_gpu:
+        print("[INFO] YOLOv8 (PyTorch) está usando GPU:", torch.cuda.get_device_name(0))
+    else:
+        print("[INFO] YOLOv8 (PyTorch) está usando CPU.")
+except ImportError:
+    torch_available = False
+    yolo_uses_gpu = False
+    print("[ALERTA] PyTorch não instalado. YOLOv8 deve estar usando CPU.")
+
+# Checagem do InsightFace/MXNet
+try:
+    import mxnet
+    n_gpus = mxnet.context.num_gpus()
+    if n_gpus > 0:
+        print(f"[INFO] InsightFace (MXNet) detectou {n_gpus} GPU(s).")
+        insightface_uses_gpu = True
+    else:
+        print("[INFO] InsightFace (MXNet) está usando CPU.")
+        insightface_uses_gpu = False
+except ImportError:
+    print("[ALERTA] MXNet não instalado. InsightFace pode não estar usando GPU.")
+    insightface_uses_gpu = False
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     epsilon = 1e-8
-    return np.dot(a, b) / (norm(a) * norm(b) + epsilon)
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + epsilon)
 
-class UnifiedRecognizerParallel:
-    """
-    Sistema unificado para:
-      • Reconhecimento facial com InsightFace
-      • Detecção corporal via YOLOv8
-      • Rastreamento assíncrono
-      • Detecção de quedas via heurística de bounding‐box
-    """
+def detect_fall_ultimate(history: deque, fallen_already=False, debug=False) -> bool:
+    N = len(history)
+    if N < 16: return False
+    aspect_ratios = np.array([h/(w+1e-6) for x, y, w, h in history])
+    cy = np.array([y + h/2 for x, y, w, h in history])
+    areas = np.array([w*h for x, y, w, h in history])
+    ar_start = np.mean(aspect_ratios[:5])
+    ar_end = np.mean(aspect_ratios[-5:])
+    delta_ar = ar_start - ar_end
+    criteria_ar_drop = (ar_start > 1.3) and (delta_ar > (ar_start * 0.28))
+    max_dy = np.max(cy[8:] - cy[:-8])
+    criteria_fast_fall = max_dy > 9.5
+    area_start = np.mean(areas[:5])
+    area_end = np.mean(areas[-5:])
+    area_ratio = area_start / (area_end + 1e-6)
+    criteria_area = area_ratio > 1.20
+    std_cy_post = np.std(cy[-7:])
+    std_ar_post = np.std(aspect_ratios[-7:])
+    criteria_immobile = std_cy_post < 7 and std_ar_post < 0.13
+    n_flat = np.sum(aspect_ratios[-7:] < 1.2)
+    criteria_flat = n_flat >= 4
+    criteria = [criteria_ar_drop, criteria_fast_fall, criteria_area, criteria_immobile, criteria_flat]
+    fall_detected = (sum(criteria) >= 3) and not fallen_already
+    return fall_detected
 
-    def __init__(
-        self,
-        video_path: str,
-        face_db_path: str = "trainer/face_db.pickle",
-        min_similarity: float = 0.5,
-        face_detection_interval: int = 10,
-        scale_factor: float = 0.15,
-    ):
+class FallFaceDetectorDeepSort:
+    def __init__(self, video_path, face_db_path="trainer/face_db.pickle", fall_history=18, scale_factor=1.0):
         self.video_path = video_path
-        self.min_similarity = min_similarity
-        self.face_detection_interval = face_detection_interval
+        self.fall_history = fall_history
         self.scale_factor = scale_factor
         self.font = cv2.FONT_HERSHEY_SIMPLEX
 
-        # Carrega banco de dados facial
-        if os.path.exists(face_db_path):
-            with open(face_db_path, "rb") as f:
+        self.yolo_model = YOLO("yolov8n.pt")
+        print(f"[INFO] YOLO modelo carregado. Dispositivo ativo: {'GPU' if yolo_uses_gpu else 'CPU'}.")
+
+        self.yolo_conf_threshold = 0.5
+        self.tracker = DeepSort(max_age=8, n_init=2, nms_max_overlap=1.0, embedder="mobilenet", half=True)
+
+        self.face_db_path = face_db_path
+        if os.path.exists(self.face_db_path):
+            with open(self.face_db_path, "rb") as f:
                 self.face_db = pickle.load(f)
             print("[INFO] Banco de dados facial carregado.")
         else:
             self.face_db = {}
             print("[ALERTA] Banco de dados facial não encontrado!")
 
-        # InsightFace
         self.recognizer = insightface.app.FaceAnalysis()
-        self.recognizer.prepare(ctx_id=0)
+        try:
+            self.recognizer.prepare(ctx_id=0)
+            print("[INFO] InsightFace está usando GPU para reconhecimento facial.")
+        except Exception:
+            print("[ERRO] InsightFace GPU não disponível, usando CPU.")
+            self.recognizer.prepare(ctx_id=-1)
 
-        # YOLOv8 para corpo
-        self.yolo_model = YOLO("yolov8n.pt")
-        self.yolo_conf_threshold = 0.5
-
-        # Rastreamento facial
-        self.face_tracks = []
-        self.face_match_threshold = 50
-        self.face_max_miss = 3
-        self.lock_threshold = 0.6
-
-        # Rastreamento corporal
-        self.body_multi_tracker = cv2.legacy.MultiTracker_create()
-        self.prev_body_boxes = []
-
-        # Parâmetros de detecção de queda
-        self.fall_history = 10                  # frames de histórico
-        self.aspect_ratio_threshold = 0.6       # h/w menor = deitado
-        self.height_drop_threshold = 0.3        # queda >30% da altura inicial
-        self.fall_consecutive_frames = 3        # quadros consecutivos para disparar
-        self.body_tracks = []                   # histórico de cada corpo
+        self.track_histories = {}
+        self.track_fallen = {}
+        self.last_fall_time = {}
+        self.track_face_label = {}
 
     def get_label_from_embedding(self, embedding: np.ndarray):
         best_label = "Desconhecido"
@@ -81,237 +111,143 @@ class UnifiedRecognizerParallel:
             if sim > best_sim:
                 best_sim = sim
                 best_label = label
-        if best_sim >= self.min_similarity:
+        if best_sim >= 0.5:
             return best_label, best_sim
         return "Desconhecido", best_sim
 
-    def process_face_detection_task(self, frame):
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        faces = self.recognizer.get(rgb)
-        if faces:
-            self.update_face_tracks_with_detections(faces, frame)
-
-    def process_body_detection_task(self, frame):
-        results = self.yolo_model(frame)[0]
-        multi = cv2.legacy.MultiTracker_create()
-        boxes = []
-        for box in results.boxes:
-            if int(box.cls[0]) != 0:  # classe 0 = pessoa
-                continue
-            conf = float(box.conf[0])
-            if conf < self.yolo_conf_threshold:
-                continue
-            coords = box.xyxy[0].cpu().numpy()
-            x1, y1, x2, y2 = coords.astype(int)
-            tracker_box = (x1, y1, x2 - x1, y2 - y1)
-            trk = cv2.legacy.TrackerCSRT_create()
-            multi.add(trk, frame, tracker_box)
-            boxes.append(tracker_box)
-        return multi, boxes
-
-    def update_face_tracks_with_detections(self, detections, frame):
-        updated = [False] * len(self.face_tracks)
-        for face in detections:
-            x1, y1, x2, y2 = face.bbox.astype(int)
-            center = ((x1 + x2)//2, (y1 + y2)//2)
-            box = (x1, y1, x2-x1, y2-y1)
-            label, sim = self.get_label_from_embedding(face.embedding)
-            locked = (sim >= self.lock_threshold)
-
-            matched = False
-            for i, tr in enumerate(self.face_tracks):
-                tx, ty = tr["center"]
-                if np.hypot(center[0]-tx, center[1]-ty) < self.face_match_threshold:
-                    if not tr.get("locked", False):
-                        new_trk = cv2.legacy.TrackerCSRT_create()
-                        new_trk.init(frame, box)
-                        tr.update({
-                            "bbox": (x1, y1, x2, y2),
-                            "center": center,
-                            "label": label,
-                            "similarity": sim,
-                            "locked": locked,
-                            "tracker": new_trk,
-                            "miss": 0
-                        })
-                    updated[i] = True
-                    matched = True
-                    break
-
-            if not matched:
-                trk = cv2.legacy.TrackerCSRT_create()
-                trk.init(frame, box)
-                self.face_tracks.append({
-                    "bbox": (x1, y1, x2, y2),
-                    "center": center,
-                    "label": label,
-                    "similarity": sim,
-                    "locked": locked,
-                    "miss": 0,
-                    "tracker": trk
-                })
-                updated.append(True)
-
-        # incrementa miss e filtra
-        for i, tr in enumerate(self.face_tracks):
-            if not updated[i]:
-                tr["miss"] += 1
-        self.face_tracks = [
-            tr for tr in self.face_tracks if tr["miss"] <= self.face_max_miss
-        ]
-
-    def update_face_tracks_with_tracking(self, frame):
-        to_remove = []
-        for i, tr in enumerate(self.face_tracks):
-            ok, bbox = tr["tracker"].update(frame)
-            if ok:
-                x, y, w, h = map(int, bbox)
-                tr["bbox"] = (x, y, x+w, y+h)
-                tr["center"] = ((2*x+w)//2, (2*y+h)//2)
-            else:
-                tr["miss"] += 1
-            if tr["miss"] > self.face_max_miss:
-                to_remove.append(i)
-        for i in reversed(to_remove):
-            del self.face_tracks[i]
-
-    def detect_fall(self, history: deque) -> bool:
-        if len(history) < self.fall_history:
-            return False
-        x0, y0, w0, h0 = history[0]
-        init_cy = y0 + h0/2
-        recent = list(history)[-self.fall_consecutive_frames:]
-        count = 0
-        for x, y, w, h in recent:
-            cy = y + h/2
-            aspect = h / (w + 1e-6)
-            drop = (cy - init_cy) > (h0 * self.height_drop_threshold)
-            laid = aspect < self.aspect_ratio_threshold
-            if drop and laid:
-                count += 1
-        return count >= self.fall_consecutive_frames
-
-    def update_body_tracks(self, boxes):
-        # garante tracks paralelos
-        while len(self.body_tracks) < len(boxes):
-            self.body_tracks.append({
-                "history": deque(maxlen=self.fall_history),
-                "fallen": False
-            })
-        # atualiza e detecta
-        for i, box in enumerate(boxes):
-            tr = self.body_tracks[i]
-            tr["history"].append(box)
-            if not tr["fallen"] and self.detect_fall(tr["history"]):
-                tr["fallen"] = True
-        # trim excess
-        if len(self.body_tracks) > len(boxes):
-            self.body_tracks = self.body_tracks[:len(boxes)]
-
-    def process(self) -> None:
+    def process(self):
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
             print("[ERRO] Não foi possível abrir o vídeo.")
             return
-
         w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        w1 = int(w0 * self.scale_factor)
-        h1 = int(h0 * self.scale_factor)
+        if self.scale_factor > 1.0:
+            self.scale_factor = 1.0
+        w1 = max(1, int(w0 * self.scale_factor))
+        h1 = max(1, int(h0 * self.scale_factor))
         print(f"[INFO] Resolução de trabalho: {w1}x{h1}")
 
         frame_count = 0
-        body_future = None
+        last_time = time.time()
+        FPS_SMOOTH = 0
+        show_fall_alert = False
+        fall_alert_timer = 0
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future_face = None
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    print("[INFO] Fim do vídeo ou erro.")
-                    break
-                frame = cv2.resize(frame, (w1, h1))
-                frame_count += 1
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("[INFO] Fim do vídeo ou erro.")
+                break
+            if frame is None or frame.shape[0] == 0 or frame.shape[1] == 0:
+                print("[ERRO] Frame inválido.")
+                break
+            frame = cv2.resize(frame, (w1, h1))
+            frame_count += 1
 
-                # face detection assíncrona
-                if frame_count % self.face_detection_interval == 0:
-                    future_face = executor.submit(
-                        self.process_face_detection_task, frame.copy()
-                    )
+            now = time.time()
+            elapsed = now - last_time
+            last_time = now
+            fps = 1.0 / (elapsed + 1e-8)
+            FPS_SMOOTH = FPS_SMOOTH * 0.95 + fps * 0.05 if frame_count > 10 else fps
+
+            results = self.yolo_model(frame)[0]
+            detections = []
+            for box in results.boxes:
+                if int(box.cls[0]) == 0:
+                    xyxy = box.xyxy[0]
+                    if hasattr(xyxy, "cpu"):
+                        xyxy = xyxy.cpu().numpy()
+                    x1, y1, x2, y2 = map(int, xyxy)
+                    conf = float(box.conf[0])
+                    if conf < self.yolo_conf_threshold:
+                        continue
+                    detections.append(([x1, y1, x2 - x1, y2 - y1], conf, "person"))
+
+            tracks = self.tracker.update_tracks(detections, frame=frame)
+            queda_exibida = False
+
+            for track in tracks:
+                if not track.is_confirmed():
+                    continue
+                track_id = track.track_id
+                ltrb = track.to_ltrb()
+                x1, y1, x2, y2 = map(int, ltrb)
+                w, h = x2 - x1, y2 - y1
+                box = (x1, y1, w, h)
+
+                if track_id not in self.track_histories:
+                    self.track_histories[track_id] = deque(maxlen=self.fall_history)
+                    self.track_fallen[track_id] = False
+                self.track_histories[track_id].append(box)
+
+                # --- Reconhecimento facial + retângulo ---
+                h_face = int(h * 0.55)
+                face_roi = frame[y1:y1 + h_face, x1:x2]
+                label = "Desconhecido"
+                similarity = 0.0
+                if face_roi.shape[0] > 30 and face_roi.shape[1] > 30:
+                    faces = self.recognizer.get(cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB))
+                    if faces:
+                        face = faces[0]
+                        label, similarity = self.get_label_from_embedding(face.embedding)
+                        fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+                        abs_fx1 = x1 + fx1
+                        abs_fy1 = y1 + fy1
+                        abs_fx2 = x1 + fx2
+                        abs_fy2 = y1 + fy2
+                        cv2.rectangle(frame, (abs_fx1, abs_fy1), (abs_fx2, abs_fy2), (0, 255, 255), 2)
+                self.track_face_label[track_id] = label
+
+                fall = detect_fall_ultimate(self.track_histories[track_id], self.track_fallen[track_id], debug=False)
+                if fall:
+                    if not self.track_fallen[track_id]:
+                        print(f"[EVENTO] Queda detectada para ID {track_id}!")
+                        self.last_fall_time[track_id] = time.time()
+                    self.track_fallen[track_id] = True
+                    queda_exibida = True
                 else:
-                    self.update_face_tracks_with_tracking(frame)
+                    self.track_fallen[track_id] = False
 
-                # body detection assíncrona
-                if body_future is None or body_future.done():
-                    if body_future:
-                        try:
-                            multi, boxes0 = body_future.result()
-                            self.body_multi_tracker = multi
-                            self.prev_body_boxes = boxes0
-                        except Exception as e:
-                            print(f"[ERRO] detect_body: {e}")
-                    body_future = executor.submit(
-                        self.process_body_detection_task, frame.copy()
-                    )
+                color = (0, 0, 255) if self.track_fallen[track_id] else (0, 255, 0)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, f"ID:{track_id}", (x1, y1-8), self.font, 0.8, color, 2)
+                cv2.putText(frame, f"{label}:{similarity:.2f}", (x1, y1-28), self.font, 0.8, (0, 255, 255), 2)
+                if self.track_fallen[track_id]:
+                    cv2.putText(frame, "QUEDA!", (x1, y2+25), self.font, 0.9, (0,0,255), 2)
 
-                # update tracks
-                ok, tracked_boxes = self.body_multi_tracker.update(frame)
-                new_boxes = []
-                if ok:
-                    for idx, box in enumerate(tracked_boxes):
-                        x, y, w, h = map(int, box)
-                        # suaviza
-                        if idx < len(self.prev_body_boxes):
-                            px, py, pw, ph = self.prev_body_boxes[idx]
-                            x = int(0.3*x + 0.7*px)
-                            y = int(0.3*y + 0.7*py)
-                            w = int(0.3*w + 0.7*pw)
-                            h = int(0.3*h + 0.7*ph)
-                        new_boxes.append((x, y, w, h))
-                        cv2.rectangle(frame, (x, y), (x+w, y+h), (255,255,0), 2)
-                        cv2.putText(frame, "Body", (x, y-10),
-                                    self.font, 0.7, (0,255,0), 2)
+            if any(time.time() - t < 2 for t in self.last_fall_time.values()):
+                show_fall_alert = True
+                fall_alert_timer = time.time()
+            if show_fall_alert:
+                cv2.rectangle(frame, (0,0), (frame.shape[1], 50), (0,0,255), -1)
+                cv2.putText(frame, "QUEDA DETECTADA!", (30, 38), self.font, 1.4, (255,255,255), 4)
+                if time.time() - fall_alert_timer > 2.0:
+                    show_fall_alert = False
 
-                # detecção de queda
-                self.update_body_tracks(new_boxes)
-                for i, (x, y, w, h) in enumerate(new_boxes):
-                    if self.body_tracks[i]["fallen"]:
-                        cv2.putText(frame, "QUEDA!", (x, y+h+25),
-                                    self.font, 0.9, (0,0,255), 2)
+            cv2.putText(frame, f"FPS: {FPS_SMOOTH:.2f}", (10, frame.shape[0]-10), self.font, 0.9, (20,200,255), 2)
 
-                self.prev_body_boxes = new_boxes
-
-                # desenha tracks faciais
-                for tr in self.face_tracks:
-                    x1, y1, x2, y2 = tr["bbox"]
-                    color = (0,255,0) if tr.get("locked") else (0,255,255)
-                    cv2.rectangle(frame, (x1,y1), (x2,y2), color, 2)
-                    cv2.putText(
-                        frame,
-                        f"{tr['label']}:{tr['similarity']:.2f}",
-                        (x2+10, y1 + (y2-y1)//2),
-                        self.font, 0.8, color, 2
-                    )
-
-                cv2.imshow("Unificado: Face, Corpo e Quedas", frame)
-                if cv2.waitKey(1) & 0xFF == 27:
-                    break
-
+            cv2.imshow("YOLOv8 + DeepSORT: Face, Corpos, Queda", frame)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
         cap.release()
         cv2.destroyAllWindows()
+        print("\n[RESUMO FINAL]")
+        print(f"YOLOv8 rodou usando: {'GPU' if yolo_uses_gpu else 'CPU'}")
+        print(f"InsightFace rodou usando: {'GPU' if insightface_uses_gpu else 'CPU'}")
+        print("DeepSort: Embedding via mobilenet (CPU)")
 
-def main() -> None:
+def main():
     video_path = input("Caminho do vídeo (ou '0' para webcam): ").strip()
     if video_path == "0":
         video_path = 0
-    recognizer = UnifiedRecognizerParallel(
+    detector = FallFaceDetectorDeepSort(
         video_path=video_path,
         face_db_path="trainer/face_db.pickle",
-        min_similarity=0.5,
-        face_detection_interval=10,
-        scale_factor=1.2
+        fall_history=18,
+        scale_factor=1.0
     )
-    recognizer.process()
+    detector.process()
 
 if __name__ == "__main__":
     main()
