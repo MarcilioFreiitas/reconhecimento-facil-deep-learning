@@ -1,61 +1,72 @@
+Excelente README! Vou **adaptar o texto para o seu novo código** e sugerir melhorias para que o README fique fiel ao seu pipeline atual (YOLOv8 + DeepSORT + InsightFace, com prints de GPU, etc).
+Vou focar na clareza, realismo e orientar sobre dependências para CPU/GPU, incluindo dicas práticas de instalação.
+
+---
+
 # Reconhecimento Fácil Deep Learning 🎥🤖
 
-> Sistema unificado para **reconhecimento facial**, **detecção corporal**, **rastreamento assíncrono** e **detecção de quedas**, tudo em Python.
+> Sistema unificado para **reconhecimento facial** com GPU opcional, **detecção corporal YOLOv8**, **rastreamento DeepSORT** e **detecção de quedas**, totalmente em Python, pronto para rodar em CPU ou GPU.
 
 ---
 
 ## 📋 Sumário
 
-- [Sobre](#sobre)  
-- [✨ Funcionalidades](#-funcionalidades)  
-- [🚀 Tecnologias e Dependências](#-tecnologias-e-dependências)  
-- [⚙️ Instalação](#️-instalação)  
-- [🗂️ Estrutura do Projeto](#️-estrutura-do-projeto)  
-- [📝 Preparando o Dataset e Enrollamento](#️-preparando-o-dataset-e-enrollamento)  
-- [🎯 Uso do Reconhecedor](#-uso-do-reconhecedor)  
-- [⚙️ Configurações Adicionais](#️-configurações-adicionais)  
-- [🤝 Contribuições](#-contribuições)  
-- [📄 Licença](#-licença)  
+* [Sobre](#sobre)
+* [✨ Funcionalidades](#-funcionalidades)
+* [🚀 Tecnologias e Dependências](#-tecnologias-e-dependências)
+* [⚙️ Instalação](#️-instalação)
+* [🗂️ Estrutura do Projeto](#️-estrutura-do-projeto)
+* [📝 Preparo do Banco Facial (Enroll)](#️-preparo-do-banco-facial-enroll)
+* [🎯 Uso do Sistema Unificado](#-uso-do-sistema-unificado)
+* [🔬 Suporte a GPU](#-suporte-a-gpu)
+* [⚙️ Configurações Avançadas](#️-configurações-avançadas)
+* [🤝 Contribuições](#-contribuições)
+* [📄 Licença](#-licença)
 
 ---
 
 ## Sobre
 
-Este repositório reúne dois módulos:
+Este repositório reúne dois módulos principais:
 
-1. **enroll_faces.py** – Extrai e agrupa embeddings faciais a partir de um _dataset_ de imagens, usando InsightFace + data augmentation.  
-2. **unified_recognizer.py** – Captura vídeo (arquivo ou webcam), detecta rostos, corpos, rastreia ambos em threads separadas e dispara alertas de queda com heurística leve.
+1. **enroll\_faces.py** – Extrai e agrupa embeddings faciais a partir de um *dataset* de imagens, usando InsightFace, com augmentation automático.
+2. **unified\_recognizer.py** – Sistema principal: captura vídeo, faz detecção e rastreamento de corpos (YOLOv8 + DeepSORT), reconhecimento facial (InsightFace), e detecta quedas de forma robusta e performática. Indica no console se cada etapa está rodando em CPU ou GPU.
 
-Ideal para aplicações de vigilância, monitoramento de idosos ou experiências interativas que demandem percepção visual em tempo real.
+Ideal para aplicações de monitoramento, teleassistência, saúde, robótica e experimentação em visão computacional.
 
 ---
 
 ## ✨ Funcionalidades
 
-- 💁‍♂️ **Reconhecimento Facial** com [InsightFace](https://github.com/deepinsight/insightface)  
-- 🏃‍♂️ **Detecção Corporal** em tempo real via [YOLOv8](https://github.com/ultralytics/ultralytics)  
-- 🔄 **Rastreamento Assíncrono** multi‐thread (face & corpo)  
-- ⚠️ **Detecção de Quedas** por análise de histórico de bounding‐boxes  
-- 🖼️ **Augmentation Automático** no processo de enroll (flip, brilho, rotação)  
-- 📺 Suporte a vídeo local e webcam  
+* 💁‍♂️ **Reconhecimento Facial** com [InsightFace](https://github.com/deepinsight/insightface), pronto para GPU
+* 🏃‍♂️ **Detecção Corporal** em tempo real com [YOLOv8](https://github.com/ultralytics/ultralytics) (PyTorch, CPU/GPU automático)
+* 🔄 **Rastreamento DeepSORT** para corpos
+* ⚠️ **Detecção de Quedas** heurística, adaptável
+* 🖼️ **Data Augmentation** no enroll automático
+* 📺 Suporte a vídeo local e webcam
+* 🖥️ **Prints automáticos informando se o processamento está em CPU ou GPU**
 
 ---
 
 ## 🚀 Tecnologias e Dependências
 
-- Python ≥ 3.8  
-- OpenCV  
-- NumPy  
-- [InsightFace](https://github.com/deepinsight/insightface)  
-- [Ultralytics YOLOv8](https://pypi.org/project/ultralytics/)  
-- concurrent.futures (thread pool)  
-- pickle (serialização de embeddings)  
+* Python ≥ 3.8
+* OpenCV
+* NumPy
+* [InsightFace](https://github.com/deepinsight/insightface) (CPU ou GPU)
+* [Ultralytics YOLOv8](https://pypi.org/project/ultralytics/) (CPU ou GPU)
+* [DeepSORT realtime](https://github.com/levan92/deep_sort_realtime)
+* pickle
+* mxnet (para InsightFace, use versão correta para seu CUDA/CPU)
+* torch (PyTorch com ou sem CUDA)
 
-Instale via `pip`:
+**Instalação básica:**
 
 ```bash
-pip install opencv-python numpy insightface ultralytics
+pip install opencv-python numpy insightface ultralytics deep_sort_realtime
 ```
+
+> Para usar GPU, veja a seção [🔬 Suporte a GPU](#-suporte-a-gpu).
 
 ---
 
@@ -63,21 +74,20 @@ pip install opencv-python numpy insightface ultralytics
 
 ```bash
 # Clone este repositório
-git clone git@github.com:MarcilioFreiitas/reconhecimento-facil-deep-learning.git
+git clone https://github.com/MarcilioFreiitas/reconhecimento-facil-deep-learning.git
 cd reconhecimento-facil-deep-learning
 
-# Crie e ative um ambiente virtual (opcional, mas recomendado)
+# (Recomendado) Crie e ative um ambiente virtual ou conda
 python -m venv venv
-# Windows
+# Windows:
 venv\Scripts\activate
-# Mac/Linux
+# Mac/Linux:
 source venv/bin/activate
 
-# Instale dependências
+# Instale as dependências
 pip install -r requirements.txt
+# Ou, se não existir o arquivo, instale manualmente conforme acima
 ```
-
-> Se não houver `requirements.txt`, instale manualmente conforme [Dependências](#-tecnologias-e-dependências).
 
 ---
 
@@ -88,9 +98,9 @@ pip install -r requirements.txt
 │   ├── pessoa1/
 │   │   ├── img1.jpg
 │   │   └── img2.jpg
-│   └── pessoa2.jpg             # ou diretamente na raiz
+│   └── pessoa2.jpg
 ├── enroll_faces.py            # Script de preparo e enroll
-├── unified_recognizer.py      # Sistema principal de detecção/rastreamento
+├── unified_recognizer.py      # Sistema principal de detecção/rastreamento/quedas
 ├── trainer/
 │   └── face_db.pickle         # Banco de embeddings gerado
 └── README.md
@@ -98,79 +108,84 @@ pip install -r requirements.txt
 
 ---
 
-## 📝 Preparando o Dataset e Enrollamento
+## 📝 Preparo do Banco Facial (Enroll)
 
-1. Organize suas imagens em `dataset/`.  
-   - Subpastas: cada pasta é um **rótulo** (nome da pessoa).  
-   - Arquivos isolados: nome antes do “.” vira rótulo.  
-2. Execute o enroll:
+1. Organize suas imagens em `dataset/`, separadas por pessoa.
+2. Execute:
 
 ```bash
 python enroll_faces.py
 ```
 
-- Informe o caminho do `dataset` ou pressione Enter (padrão: `dataset`).  
-- Informe onde salvar o banco de dados (padrão: `trainer/face_db.pickle`).  
-
-O script gerará variações de cada imagem (flip, brilho, rotação), extrairá embeddings e salvará a média por pessoa.
+* Informe o caminho do dataset e onde salvar o banco facial (opcional).
+* O script gera variações, extrai embeddings e salva a média por pessoa.
 
 ---
 
-## 🎯 Uso do Reconhecedor
+## 🎯 Uso do Sistema Unificado
 
 ```bash
 python unified_recognizer.py
 ```
 
-- **Entrada**: caminho para vídeo ou `0` para webcam.  
-- **Flags de configuração** (opcionais, editar no código):
-  - `min_similarity`: limiar de confiança para reconhecimento  
-  - `face_detection_interval`: intervalo de detecção de faces  
-  - `scale_factor`: escala de redimensionamento do frame  
-- **Saída**: janela interativa com:
-  - Caixas e rótulos de rostos  
-  - Caixas de corpos  
-  - Alerta “**QUEDA!**” abaixo do corpo em caso de evento detectado  
-
-Pressione **Esc** para encerrar.
+* Informe o caminho do vídeo ou `0` para webcam.
+* O sistema mostra no console, a cada execução, se o YOLOv8 (PyTorch) e o InsightFace (MXNet) estão usando **CPU ou GPU**.
+* Janela com detecção de corpos, faces e alerta "QUEDA!" no vídeo.
+* Pressione **Esc** para encerrar.
 
 ---
 
-## ⚙️ Configurações Adicionais
+## 🔬 Suporte a GPU
 
-- Caso utilize GPU e tenha problemas com _duplicate libs_, já configuramos:
-  ```python
-  os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-  ```
-- Ajuste thresholds de queda em `unified_recognizer.py`:
-  ```python
-  self.height_drop_threshold = 0.3        # % da altura inicial
-  self.aspect_ratio_threshold = 0.6       # h/w menor = deitado
-  self.fall_consecutive_frames = 3        # persistência (frames)
-  ```
-- Para usar outro modelo YOLO, altere na inicialização:
+**YOLOv8 e InsightFace suportam GPU, mas dependem do seu ambiente.**
+
+### Como garantir o uso de GPU:
+
+1. **Drivers NVIDIA** instalados e CUDA disponível.
+2. **PyTorch** instalado com CUDA.
+
+   * Veja seu CUDA com `nvidia-smi`.
+   * Exemplo para CUDA 12.1:
+
+     ```bash
+     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+     ```
+3. **MXNet** instalado na versão CUDA correta:
+
+   * Para CUDA 12.1:
+
+     ```bash
+     pip install mxnet-cu121
+     ```
+   * Para CPU apenas:
+
+     ```bash
+     pip install mxnet
+     ```
+4. Rode seu script normalmente! O console informará se GPU está ativa.
+
+---
+
+## ⚙️ Configurações Avançadas
+
+* Ajuste thresholds e parâmetros de queda/editando `unified_recognizer.py`.
+* Troque o modelo YOLO alterando:
+
   ```python
   self.yolo_model = YOLO("yolov8n.pt")
   ```
+* Veja mensagens de status no terminal: o script mostra se está usando CPU ou GPU em cada etapa.
 
 ---
 
 ## 🤝 Contribuições
 
-Contribuições são muito bem‐vindas!  
-1. Fork este repositório  
-2. Crie uma branch feature: `git checkout -b feature/nome-da-feature`  
-3. Commit suas mudanças: `git commit -m "✨ Nova feature"`  
-4. Push na branch: `git push origin feature/nome-da-feature`  
-5. Abra um Pull Request  
+Contribuições são bem‐vindas!
 
----
+1. Fork este repositório
+2. Crie uma branch feature: `git checkout -b feature/nome-da-feature`
+3. Commit suas mudanças: `git commit -m "✨ Nova feature"`
+4. Push: `git push origin feature/nome-da-feature`
+5. Abra um Pull Request
 
-## 📄 Licença
 
-Este projeto está sob a [MIT License](LICENSE).  
-
----
-
-> Desenvolvido por **Marcilio Freiitas** 🚀  
-> Dúvidas ou feedback? Abra uma [issue](https://github.com/MarcilioFreiitas/reconhecimento-facil-deep-learning/issues).
