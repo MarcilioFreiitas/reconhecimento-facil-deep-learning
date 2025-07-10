@@ -11,19 +11,23 @@ from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 import insightface
 
-# Checagem do dispositivo do PyTorch/YOLO
+# ====== Configuração de desempenho =======
+RESOLUCAO = (640, 390)   # (width, height) - Reduza para ganhar FPS (ex: 320x192 ou 416x256)
+YOLO_MODEL_PATH = "yolov8n.pt"  # Use yolov8n.pt para máxima velocidade.
+# Se quiser, pode testar yolov8n-seg.pt ou yolov8n-int8.pt (quantizado)
+# =========================================
+
+# Checagem do dispositivo
 try:
     import torch
-    torch_available = True
     yolo_uses_gpu = torch.cuda.is_available()
     if yolo_uses_gpu:
         print("[INFO] YOLOv8 (PyTorch) está usando GPU:", torch.cuda.get_device_name(0))
     else:
         print("[INFO] YOLOv8 (PyTorch) está usando CPU.")
 except ImportError:
-    torch_available = False
     yolo_uses_gpu = False
-    print("[ALERTA] PyTorch não instalado. YOLOv8 deve estar usando CPU.")
+    print("[ALERTA] PyTorch não instalado.")
 
 # Checagem do InsightFace/MXNet
 try:
@@ -36,7 +40,6 @@ try:
         print("[INFO] InsightFace (MXNet) está usando CPU.")
         insightface_uses_gpu = False
 except ImportError:
-    print("[ALERTA] MXNet não instalado. InsightFace pode não estar usando GPU.")
     insightface_uses_gpu = False
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -69,14 +72,13 @@ def detect_fall_ultimate(history: deque, fallen_already=False, debug=False) -> b
     return fall_detected
 
 class FallFaceDetectorDeepSort:
-    def __init__(self, video_path, face_db_path="trainer/face_db.pickle", fall_history=18, scale_factor=1.0):
+    def __init__(self, video_path, face_db_path="trainer/face_db.pickle", fall_history=18):
         self.video_path = video_path
         self.fall_history = fall_history
-        self.scale_factor = scale_factor
         self.font = cv2.FONT_HERSHEY_SIMPLEX
 
-        self.yolo_model = YOLO("yolov8n.pt")
-        print(f"[INFO] YOLO modelo carregado. Dispositivo ativo: {'GPU' if yolo_uses_gpu else 'CPU'}.")
+        self.yolo_model = YOLO(YOLO_MODEL_PATH)
+        print(f"[INFO] YOLO modelo carregado ({YOLO_MODEL_PATH}). Dispositivo: {'GPU' if yolo_uses_gpu else 'CPU'}.")
 
         self.yolo_conf_threshold = 0.5
         self.tracker = DeepSort(max_age=8, n_init=2, nms_max_overlap=1.0, embedder="mobilenet", half=True)
@@ -120,13 +122,9 @@ class FallFaceDetectorDeepSort:
         if not cap.isOpened():
             print("[ERRO] Não foi possível abrir o vídeo.")
             return
-        w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if self.scale_factor > 1.0:
-            self.scale_factor = 1.0
-        w1 = max(1, int(w0 * self.scale_factor))
-        h1 = max(1, int(h0 * self.scale_factor))
-        print(f"[INFO] Resolução de trabalho: {w1}x{h1}")
+
+        w1, h1 = RESOLUCAO
+        print(f"[INFO] Resolução de trabalho otimizada: {w1}x{h1}")
 
         frame_count = 0
         last_time = time.time()
@@ -142,6 +140,7 @@ class FallFaceDetectorDeepSort:
             if frame is None or frame.shape[0] == 0 or frame.shape[1] == 0:
                 print("[ERRO] Frame inválido.")
                 break
+            # Redimensiona frame para RESOLUCAO
             frame = cv2.resize(frame, (w1, h1))
             frame_count += 1
 
@@ -151,10 +150,11 @@ class FallFaceDetectorDeepSort:
             fps = 1.0 / (elapsed + 1e-8)
             FPS_SMOOTH = FPS_SMOOTH * 0.95 + fps * 0.05 if frame_count > 10 else fps
 
+            # YOLO só para 1 frame. Para batch, veja abaixo.
             results = self.yolo_model(frame)[0]
             detections = []
             for box in results.boxes:
-                if int(box.cls[0]) == 0:
+                if int(box.cls[0]) == 0:  # Só pessoa!
                     xyxy = box.xyxy[0]
                     if hasattr(xyxy, "cpu"):
                         xyxy = xyxy.cpu().numpy()
@@ -165,7 +165,6 @@ class FallFaceDetectorDeepSort:
                     detections.append(([x1, y1, x2 - x1, y2 - y1], conf, "person"))
 
             tracks = self.tracker.update_tracks(detections, frame=frame)
-            queda_exibida = False
 
             for track in tracks:
                 if not track.is_confirmed():
@@ -181,7 +180,6 @@ class FallFaceDetectorDeepSort:
                     self.track_fallen[track_id] = False
                 self.track_histories[track_id].append(box)
 
-                # --- Reconhecimento facial + retângulo ---
                 h_face = int(h * 0.55)
                 face_roi = frame[y1:y1 + h_face, x1:x2]
                 label = "Desconhecido"
@@ -205,7 +203,6 @@ class FallFaceDetectorDeepSort:
                         print(f"[EVENTO] Queda detectada para ID {track_id}!")
                         self.last_fall_time[track_id] = time.time()
                     self.track_fallen[track_id] = True
-                    queda_exibida = True
                 else:
                     self.track_fallen[track_id] = False
 
@@ -235,17 +232,23 @@ class FallFaceDetectorDeepSort:
         print("\n[RESUMO FINAL]")
         print(f"YOLOv8 rodou usando: {'GPU' if yolo_uses_gpu else 'CPU'}")
         print(f"InsightFace rodou usando: {'GPU' if insightface_uses_gpu else 'CPU'}")
-        print("DeepSort: Embedding via mobilenet (CPU)")
 
 def main():
+    print("="*70)
+    print("===== OTIMIZADO PARA MÁXIMO DESEMPENHO (FPS) =====")
+    print(f"Resolução reduzida: {RESOLUCAO[0]}x{RESOLUCAO[1]}")
+    print(f"Modelo YOLO: {YOLO_MODEL_PATH}")
+    print("Se for testar outros modelos, troque o caminho da variável YOLO_MODEL_PATH.")
+    print("Aumente ainda mais o FPS diminuindo a resolução ou rodando em placa de vídeo (GPU).")
+    print("="*70)
+    print("Precisa ser instalado: Drivers NVIDIA instalados,  CUDA Toolkit compatível, cuDNN compatível, mxnet-cu121 (ou ajuste para o CUDA instalado), torch, torchvision, torchaudio (PyTorch com CUDA)    ")
     video_path = input("Caminho do vídeo (ou '0' para webcam): ").strip()
     if video_path == "0":
         video_path = 0
     detector = FallFaceDetectorDeepSort(
         video_path=video_path,
         face_db_path="trainer/face_db.pickle",
-        fall_history=18,
-        scale_factor=1.0
+        fall_history=18
     )
     detector.process()
 
